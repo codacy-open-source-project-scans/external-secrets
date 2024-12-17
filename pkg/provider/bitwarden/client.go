@@ -15,11 +15,13 @@ limitations under the License.
 package bitwarden
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 
+	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/kube-openapi/pkg/validation/strfmt"
 
@@ -47,17 +49,31 @@ func (p *Provider) PushSecret(ctx context.Context, secret *corev1.Secret, data e
 		return errors.New("store does not have a provider")
 	}
 
-	if data.GetSecretKey() == "" {
-		return errors.New("pushing the whole secret is not yet implemented")
-	}
-
 	if data.GetRemoteKey() == "" {
 		return errors.New("remote key must be defined")
 	}
 
-	value, ok := secret.Data[data.GetSecretKey()]
-	if !ok {
-		return fmt.Errorf("failed to find secret key in secret with key: %s", data.GetSecretKey())
+	var (
+		value []byte
+		err   error
+		ok    bool
+	)
+	if data.GetSecretKey() == "" {
+		decodedMap := make(map[string]string)
+		for k, v := range secret.Data {
+			decodedMap[k] = string(v)
+		}
+		value, err = utils.JSONMarshal(decodedMap)
+
+		if err != nil {
+			return fmt.Errorf("failed to marshal secret data: %w", err)
+		}
+	} else {
+		value, ok = secret.Data[data.GetSecretKey()]
+
+		if !ok {
+			return fmt.Errorf("failed to find secret key in secret with key: %s", data.GetSecretKey())
+		}
 	}
 
 	note, err := utils.FetchValueFromMetadata(NoteMetadataKey, data.GetMetadata(), "")
@@ -141,6 +157,10 @@ func (p *Provider) GetSecret(ctx context.Context, ref esv1beta1.ExternalSecretDa
 		return nil, fmt.Errorf("error getting secret: %w", err)
 	}
 
+	if secret == nil {
+		return nil, fmt.Errorf("no secret found for project id %s and name %s", spec.Provider.BitwardenSecretsManager.ProjectID, ref.Key)
+	}
+
 	// we found our secret, return the value for it
 	return []byte(secret.Value), nil
 }
@@ -158,6 +178,10 @@ func (p *Provider) DeleteSecret(ctx context.Context, ref esv1beta1.PushSecretRem
 	secret, err := p.findSecretByRef(ctx, ref.GetRemoteKey(), spec.Provider.BitwardenSecretsManager.ProjectID)
 	if err != nil {
 		return fmt.Errorf("error getting secret: %w", err)
+	}
+
+	if secret == nil {
+		return fmt.Errorf("no secret found for project id %s and name %s", spec.Provider.BitwardenSecretsManager.ProjectID, ref.GetRemoteKey())
 	}
 
 	return p.deleteSecret(ctx, secret.ID)
@@ -197,8 +221,13 @@ func (p *Provider) SecretExists(ctx context.Context, ref esv1beta1.PushSecretRem
 		return false, errors.New("store does not have a provider")
 	}
 
-	if _, err := p.findSecretByRef(ctx, ref.GetRemoteKey(), spec.Provider.BitwardenSecretsManager.ProjectID); err != nil {
+	secret, err := p.findSecretByRef(ctx, ref.GetRemoteKey(), spec.Provider.BitwardenSecretsManager.ProjectID)
+	if err != nil {
 		return false, fmt.Errorf("error getting secret: %w", err)
+	}
+
+	if secret == nil {
+		return false, nil
 	}
 
 	return true, nil
@@ -211,9 +240,12 @@ func (p *Provider) GetSecretMap(ctx context.Context, ref esv1beta1.ExternalSecre
 		return nil, err
 	}
 
+	if err := yaml.Unmarshal(data, map[string]any{}); err == nil {
+		return p.parseYamlSecretData(data)
+	}
+
 	kv := make(map[string]json.RawMessage)
-	err = json.Unmarshal(data, &kv)
-	if err != nil {
+	if err := json.Unmarshal(data, &kv); err != nil {
 		return nil, fmt.Errorf("error unmarshalling secret: %w", err)
 	}
 
@@ -225,6 +257,33 @@ func (p *Provider) GetSecretMap(ctx context.Context, ref esv1beta1.ExternalSecre
 			secretData[k] = []byte(strVal)
 		} else {
 			secretData[k] = v
+		}
+	}
+
+	return secretData, nil
+}
+
+func (p *Provider) parseYamlSecretData(data []byte) (map[string][]byte, error) {
+	kv := make(map[string]any)
+	if err := yaml.Unmarshal(data, &kv); err != nil {
+		return nil, fmt.Errorf("error unmarshalling secret: %w", err)
+	}
+
+	secretData := make(map[string][]byte)
+	for k, v := range kv {
+		switch t := v.(type) {
+		case string:
+			secretData[k] = []byte(t)
+		case []byte:
+			secretData[k] = t
+		case map[string]any:
+			d, err := yaml.Marshal(t)
+			if err != nil {
+				return nil, fmt.Errorf("error marshaling secret: %w", err)
+			}
+			secretData[k] = bytes.TrimSpace(d)
+		default:
+			secretData[k] = []byte(fmt.Sprintf("%v", t)) // Convert to string and then []byte
 		}
 	}
 
@@ -300,10 +359,6 @@ func (p *Provider) findSecretByRef(ctx context.Context, key, projectID string) (
 			// such secret.
 			remoteSecret = sec
 		}
-	}
-
-	if remoteSecret == nil {
-		return nil, fmt.Errorf("no secret found for project id %s and name %s", projectID, key)
 	}
 
 	return remoteSecret, nil
